@@ -35,6 +35,9 @@
 #include "lib/utility/ob_print_utils.h"
 #include "lib/oblog/ob_log.h"
 #include "lib/worker.h"
+#ifdef OB_BUILD_CUVS
+#include "hipvs_hnsw_backend.h"
+#endif
 
 // [hipVS/cuVS] GPU vector-search bridge symbol, implemented in
 // libseekdb_cuvs_bridge.so (internally uses cuVS CAGRA on the GPU).
@@ -62,25 +65,21 @@ namespace obvsag {
 
 using namespace vsag;
 
-// ==== [hipVS/cuVS] optional GPU CAGRA backend, enabled per lib=cuvs index ====
-// When enabled, build_index also builds a cuVS CAGRA index (keyed by the index
-// handle) and knn_search serves top-k from the AMD GPU via hipVS libcuvs_c. This
-// runs seekdb's real vector-adaptor data path on the GPU. PoC: single writer per
-// index, results allocated with the handle's allocator (drop-in with VSAG path).
 namespace {
-struct ObCuvsEntry {
-  void *bridge_ = nullptr;      // opaque handle from seekdb_cuvs_build
-  int dim_ = 0;
-  std::vector<int64_t> ids_;    // CAGRA row offset -> external vid (of the built index)
-  std::vector<float> buf_vecs_; // accumulated vectors (row-major) from add_index
-  std::vector<int64_t> buf_ids_;// accumulated external vids from add_index
-  size_t built_n_ = 0;          // #vectors present when cuVS was last (re)built
+static inline void ob_vsag_trace(const char *, const void *, long, long) {}
+struct ObCuvsRawBatchJob {
+  const float *base; long n; long dim; const float *query; long nq; long topk;
+  unsigned *off; float *dst; long served_;
 };
-static std::mutex g_ob_cuvs_mu;
-static std::map<void *, ObCuvsEntry *> g_ob_cuvs_reg;
-static std::mutex g_ob_cuvs_marked_mu;
-static std::set<void *> g_ob_cuvs_marked;  // handles of lib=cuvs indexes (marked by the plugin)
-// GPU backend available? (used by the explicit dbms_vector.batch_knn path)
+static void *ob_cuvs_raw_batch_job(void *arg) {
+  auto *j = static_cast<ObCuvsRawBatchJob *>(arg);
+  void *h = seekdb_cuvs_build(j->base, j->n, j->dim);
+  if (h) {
+    if (seekdb_cuvs_search(h, j->query, j->nq, j->topk, j->off, j->dst) == 0) j->served_ = j->nq;
+    seekdb_cuvs_free(h);
+  }
+  return nullptr;
+}
 static inline bool ob_cuvs_enabled() {
 #ifdef OB_BUILD_CUVS
   return true;
@@ -88,199 +87,7 @@ static inline bool ob_cuvs_enabled() {
   return false;
 #endif
 }
-// Per-index opt-in: the plugin marks a handle when its index was declared lib=cuvs.
-static inline bool ob_cuvs_marked(void *key) {
-#ifdef OB_BUILD_CUVS
-  std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
-  return g_ob_cuvs_marked.find(key) != g_ob_cuvs_marked.end();
-#else
-  (void)key; return false;
-#endif
-}
-#ifdef OB_BUILD_CUVS_TRACE
-static std::mutex g_ob_vsag_trace_mu;
-#endif
-// Developer-only call-chain tracer. Compiled in ONLY with -DOB_BUILD_CUVS_TRACE;
-// a no-op in normal builds (no file I/O on the hot path).
-static inline void ob_vsag_trace(const char *fn, const void *h, long a, long b) {
-#ifdef OB_BUILD_CUVS_TRACE
-  const char *e = ::getenv("OB_VSAG_TRACE");
-  if (e == nullptr || e[0] != '1') { return; }
-  const char *path = ::getenv("OB_VSAG_TRACE_FILE");
-  if (path == nullptr) { path = "/tmp/obvsag_trace.log"; }
-  std::lock_guard<std::mutex> guard(g_ob_vsag_trace_mu);
-  FILE *tf = ::fopen(path, "a");
-  if (tf == nullptr) { return; }
-  ::fprintf(tf, "%-14s handle=%p a=%ld b=%ld\n", fn, h, a, b);
-  ::fclose(tf);
-#else
-  (void)fn; (void)h; (void)a; (void)b;
-#endif
-}
-static void ob_cuvs_register(void *key, const float *vectors, const int64_t *ids,
-                             int dim, int size) {
-  void *bridge = seekdb_cuvs_build(vectors, size, dim);
-  if (bridge == nullptr) { return; }
-  ObCuvsEntry *ent = new ObCuvsEntry();
-  ent->bridge_ = bridge; ent->dim_ = dim; ent->ids_.assign(ids, ids + size);
-  std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
-  ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
-  if (slot != nullptr) { seekdb_cuvs_free(slot->bridge_); delete slot; }
-  slot = ent;
-}
-// Buffer vectors arriving via add_index. Plain HNSW builds BOTH its delta and its
-// snapshot incrementally via add_index (one row at a time), so this is where the
-// real data flows -- unlike build_index which is only used by the HNSW_SQ bulk path.
-static void ob_cuvs_add(void *key, const float *vectors, const int64_t *ids,
-                        int dim, int size) {
-  if (vectors == nullptr || ids == nullptr || dim <= 0 || size <= 0) { return; }
-  std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
-  ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
-  if (slot == nullptr) { slot = new ObCuvsEntry(); slot->dim_ = dim; }
-  if (slot->dim_ == 0) { slot->dim_ = dim; }
-  if (slot->dim_ != dim) { return; }
-  slot->buf_vecs_.insert(slot->buf_vecs_.end(), vectors,
-                         vectors + static_cast<size_t>(dim) * size);
-  slot->buf_ids_.insert(slot->buf_ids_.end(), ids, ids + size);
-}
-static void ob_cuvs_erase(void *key) {
-  { std::lock_guard<std::mutex> mg(g_ob_cuvs_marked_mu); g_ob_cuvs_marked.erase(key); }
-  std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
-  auto it = g_ob_cuvs_reg.find(key);
-  if (it != g_ob_cuvs_reg.end()) {
-    if (it->second->bridge_) { seekdb_cuvs_free(it->second->bridge_); }
-    delete it->second; g_ob_cuvs_reg.erase(it);
-  }
-}
-struct ObCuvsJob {
-  ObCuvsEntry *ent; const float *query; int64_t topk; int dim; size_t n;
-  bool need_build; std::vector<unsigned> *off; std::vector<float> *dst;
-  int rc_; bool built_;
-};
-// Runs on a dedicated large-stack pthread: cuVS CAGRA build/search overflow the
-// small (~1.5MB) OB worker-thread stack.
-static void *ob_cuvs_job(void *arg) {
-  ObCuvsJob *j = static_cast<ObCuvsJob *>(arg);
-  if (j->need_build) {
-    void *nb = seekdb_cuvs_build(j->ent->buf_vecs_.data(), static_cast<long>(j->n),
-                                 static_cast<long>(j->dim));
-    if (nb != nullptr) {
-      if (j->ent->bridge_ != nullptr) { seekdb_cuvs_free(j->ent->bridge_); }
-      j->ent->bridge_ = nb; j->ent->built_n_ = j->n; j->ent->ids_ = j->ent->buf_ids_;
-      j->built_ = true;
-    }
-  }
-  // Freshness/correctness: only serve from the GPU when the cuVS index is
-  // up-to-date with the buffer. If rows were added since the last build, the
-  // caller falls back to CPU VSAG (which is always fresh). This also gives the
-  // desired split: streaming delta -> VSAG, stable snapshot -> cuVS.
-  if (j->ent->bridge_ != nullptr && j->ent->built_n_ == j->n) {
-    j->rc_ = seekdb_cuvs_search(j->ent->bridge_, j->query, 1, j->topk,
-                                j->off->data(), j->dst->data());
-  }
-  return nullptr;
-}
-
-// [BATCH] Feed nq probe vectors to ONE cuVS call (nq>1). Same large-stack
-// pthread pattern as the single-query path (cuVS overflows the OB worker stack).
-struct ObCuvsBatchJob {
-  ObCuvsEntry *ent; const float *queries; long nq; long topk; size_t n;
-  bool need_build; unsigned *off; float *dst; long served_; bool built_;
-};
-static void *ob_cuvs_batch_job(void *arg) {
-  ObCuvsBatchJob *j = static_cast<ObCuvsBatchJob *>(arg);
-  if (j->need_build) {
-    void *nb = seekdb_cuvs_build(j->ent->buf_vecs_.data(), static_cast<long>(j->n),
-                                 static_cast<long>(j->ent->dim_));
-    if (nb != nullptr) {
-      if (j->ent->bridge_ != nullptr) { seekdb_cuvs_free(j->ent->bridge_); }
-      j->ent->bridge_ = nb; j->ent->built_n_ = j->n; j->ent->ids_ = j->ent->buf_ids_;
-      j->built_ = true;
-    }
-  }
-  if (j->ent->bridge_ != nullptr && j->ent->built_n_ == j->n) {
-    if (seekdb_cuvs_search(j->ent->bridge_, j->queries, j->nq, j->topk,
-                           j->off, j->dst) == 0) { j->served_ = j->nq; }
-  }
-  return nullptr;
-}
-
-// [BATCH one-shot] Build a CAGRA over raw base + batch-search nq queries + free,
-// all on a 32MB-stack pthread (cuVS overflows the small PL/worker stack). Used by
-// dbms_vector.batch_knn, which reads vectors from SQL (no add_index registry).
-struct ObCuvsRawBatchJob {
-  const float *base; long n; long dim; const float *query; long nq; long topk;
-  unsigned *off; float *dst; long served_;
-};
-static void *ob_cuvs_raw_batch_job(void *arg) {
-  ObCuvsRawBatchJob *j = static_cast<ObCuvsRawBatchJob *>(arg);
-  void *h = seekdb_cuvs_build(j->base, j->n, j->dim);
-  if (h != nullptr) {
-    if (seekdb_cuvs_search(h, j->query, j->nq, j->topk, j->off, j->dst) == 0) {
-      j->served_ = j->nq;
-    }
-    seekdb_cuvs_free(h);
-  }
-  return nullptr;
-}
-
-static const size_t OB_CUVS_MIN_PTS = 256;  // CAGRA needs a graph; below this -> VSAG
-
-static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
-                               const float *query, int /*dim*/, int64_t topk,
-                               const float *&dist, const int64_t *&ids,
-                               int64_t &result_size, void *filter, bool reverse_filter) {
-  if (topk <= 0) { return false; }
-  std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
-  auto it = g_ob_cuvs_reg.find(key);
-  if (it == g_ob_cuvs_reg.end()) { return false; }
-  ObCuvsEntry *ent = it->second;
-  // Lazily (re)build the GPU CAGRA index when there are enough points and either
-  // nothing is built yet or the buffer grew materially (>=2x). Build+search run on
-  // a 32MB-stack pthread (cuVS overflows the OB worker stack otherwise).
-  const size_t n = ent->buf_ids_.size();
-  const bool need_build =
-      (n >= OB_CUVS_MIN_PTS && (ent->bridge_ == nullptr || n >= ent->built_n_ * 2));
-  std::vector<unsigned> off(topk);
-  std::vector<float> dst(topk);
-  ObCuvsJob job{ent, query, topk, static_cast<int>(ent->dim_), n, need_build, &off, &dst, -1, false};
-  pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
-  if (pthread_create(&tid, &attr, ob_cuvs_job, &job) == 0) { pthread_join(tid, nullptr); }
-  pthread_attr_destroy(&attr);
-  if (job.built_) { ob_vsag_trace("cuvs_build", key, static_cast<long>(ent->dim_), static_cast<long>(n)); }
-  if (ent->bridge_ == nullptr || job.rc_ != 0) { return false; }
-  // Post-filter: cuVS returned UNFILTERED top-k. Apply the query's row filter
-  // (WHERE predicate / deleted rows) with the SAME semantics VSAG uses: a row is
-  // valid iff reverse_filter ? test(vid) : !test(vid). If ANY of the top-k is
-  // excluded, fall back to VSAG (the true filtered top-k may rank beyond k here).
-  if (filter != nullptr) {
-    FilterInterface *fi = static_cast<FilterInterface *>(filter);
-    for (int64_t i = 0; i < topk; ++i) {
-      int64_t vid = (off[i] < ent->ids_.size()) ? static_cast<int64_t>(ent->ids_[off[i]]) : -1;
-      const bool valid = reverse_filter ? fi->test(vid) : !fi->test(vid);
-      if (!valid) { return false; }
-    }
-  }
-  int64_t *out_ids = static_cast<int64_t *>(
-      alloc ? alloc->Allocate(sizeof(int64_t) * topk) : ::malloc(sizeof(int64_t) * topk));
-  float *out_dist = static_cast<float *>(
-      alloc ? alloc->Allocate(sizeof(float) * topk) : ::malloc(sizeof(float) * topk));
-  if (out_ids == nullptr || out_dist == nullptr) {
-    if (alloc) { if (out_ids) alloc->Deallocate(out_ids); if (out_dist) alloc->Deallocate(out_dist); }
-    else { ::free(out_ids); ::free(out_dist); }
-    return false;
-  }
-  for (int64_t i = 0; i < topk; ++i) {
-    unsigned o = off[i];
-    out_ids[i] = (o < ent->ids_.size()) ? ent->ids_[o] : -1;
-    out_dist[i] = dst[i];
-  }
-  ids = out_ids; dist = out_dist; result_size = topk;
-  ob_vsag_trace("cuvs_serve", key, static_cast<long>(topk), static_cast<long>(ent->ids_.size()));
-  return true;
-}
-}  // anonymous namespace
+} // namespace
 
 static int vsag_errcode2ob(vsag::ErrorType vsag_errcode)
 {
@@ -395,6 +202,23 @@ public:
     index_ = nullptr;
     LOG_INFO("[OBVSAG] after deconstruction, hnsw index", KP(allocator_), K(index_.use_count()), K(lbt()));
   }
+  int enable_hipvs() {
+#ifdef OB_BUILD_CUVS
+    if (gpu_) return OB_SUCCESS;
+    if (strcmp(metric_, "l2") || strcmp(dtype_, "float32") ||
+        index_type_ != HNSW_TYPE || index_->GetNumElements() != 0) return OB_NOT_SUPPORTED;
+    try { gpu_.reset(new HipvsHnswBackend(dim_, max_degree_, ef_construction_, ef_search_, extra_info_size_)); }
+    catch (...) { return OB_ALLOCATE_MEMORY_FAILED; }
+    return OB_SUCCESS;
+#else
+    int ret = OB_NOT_SUPPORTED;
+    LOG_WARN("HIPVS build backend not compiled; CPU fallback disabled", K(ret));
+    return ret;
+#endif
+  }
+#ifdef OB_BUILD_CUVS
+  HipvsHnswBackend *gpu() { return gpu_.get(); }
+#endif
   int build_index(const vsag::DatasetPtr &base);
   int get_index_number();
   int add_index(const vsag::DatasetPtr &incremental);
@@ -445,6 +269,9 @@ public:
       K_(refine_type), K_(bq_bits_query), K_(bq_use_fht));
 
 private:
+#ifdef OB_BUILD_CUVS
+  std::unique_ptr<HipvsHnswBackend> gpu_;
+#endif
   bool is_created_;
   bool is_build_;
   bool use_static_;
@@ -468,6 +295,9 @@ private:
 
 int HnswIndexHandler::build_index(const vsag::DatasetPtr &base)
 {
+#ifdef OB_BUILD_CUVS
+  if (gpu_) { int rc = gpu_->add(base); return rc == OB_SUCCESS ? gpu_->finish() : rc; }
+#endif
   int ret = OB_SUCCESS;
   try {
     tl::expected<std::vector<int64_t>, Error> result = index_->Build(base);
@@ -487,11 +317,17 @@ int HnswIndexHandler::build_index(const vsag::DatasetPtr &base)
 
 int HnswIndexHandler::get_index_number()
 {
+#ifdef OB_BUILD_CUVS
+  if (gpu_) return gpu_->count();
+#endif
   return index_->GetNumElements();
 }
 
 int HnswIndexHandler::add_index(const vsag::DatasetPtr &incremental)
 {
+#ifdef OB_BUILD_CUVS
+  if (gpu_) return gpu_->add(incremental);
+#endif
   int ret = OB_SUCCESS;
   tl::expected<std::vector<int64_t>, Error> result = index_->Add(incremental);
   if (result.has_value()) {
@@ -536,6 +372,10 @@ int HnswIndexHandler::cal_distance_by_id(const float *vector,
                                          const int64_t *ids, int64_t count,
                                          const float *&dist)
 {
+#ifdef OB_BUILD_CUVS
+  if (gpu_) return gpu_->distance(vector, ids, count, dist, allocator_);
+#endif
+
   int ret = OB_SUCCESS;
   tl::expected<DatasetPtr, Error> result = index_->CalDistanceById(vector, ids, count);
   if (result.has_value()) {
@@ -550,6 +390,10 @@ int HnswIndexHandler::cal_distance_by_id(const float *vector,
 int HnswIndexHandler::get_extra_info_by_ids(const int64_t *ids, int64_t count,
                                             char *extra_infos)
 {
+#ifdef OB_BUILD_CUVS
+  if (gpu_) return gpu_->extra(ids, count, extra_infos);
+#endif
+
   int ret = OB_SUCCESS;
   tl::expected<void, Error> result = index_->GetExtraInfoByIds(ids, count, extra_infos);
   if (result.has_value()) {
@@ -561,6 +405,9 @@ int HnswIndexHandler::get_extra_info_by_ids(const int64_t *ids, int64_t count,
 
 int HnswIndexHandler::get_vid_bound(int64_t &min_vid, int64_t &max_vid)
 {
+#ifdef OB_BUILD_CUVS
+  if (gpu_) return gpu_->bounds(min_vid, max_vid);
+#endif
   int ret = OB_SUCCESS;
   int64_t element_cnt = index_->GetNumElements();
   if (element_cnt == 0) {
@@ -578,6 +425,9 @@ int HnswIndexHandler::get_vid_bound(int64_t &min_vid, int64_t &max_vid)
 
 uint64_t HnswIndexHandler::estimate_memory(const uint64_t row_count, const bool is_build)
 {
+#ifdef OB_BUILD_CUVS
+  if (gpu_) return gpu_->estimate(row_count);
+#endif
 
   uint64_t size = 0;
   if (IPIVF_TYPE == index_type_) {
@@ -603,6 +453,9 @@ uint64_t HnswIndexHandler::estimate_memory(const uint64_t row_count, const bool 
 
 int HnswIndexHandler::immutable_optimize()
 {
+#ifdef OB_BUILD_CUVS
+  if (gpu_) return gpu_->finish();
+#endif
   int ret = OB_SUCCESS;
   if (index_type_ == IPIVF_TYPE) {
     // TODO(ningxin.ning): support SetImmutable for sparse vector index
@@ -627,6 +480,14 @@ int HnswIndexHandler::knn_search(const vsag::DatasetPtr &query, int64_t topk,
                                  const char *&extra_infos, void *allocator,
                                  float distance_threshold)
 {
+#ifdef OB_BUILD_CUVS
+  if (gpu_) {
+    return gpu_->query(query, topk, dist, ids, result_size, parameters, bitmap, reverse_filter,
+                       need_extra_info, extra_infos,
+                       allocator ? static_cast<vsag::Allocator *>(allocator) : allocator_);
+  }
+#endif
+
   int ret = OB_SUCCESS;
   std::function<bool(int64_t)> vid_filter = [bitmap, reverse_filter](int64_t id) -> bool {
     if (!reverse_filter) {
@@ -679,6 +540,15 @@ int HnswIndexHandler::knn_search(const vsag::DatasetPtr &query, int64_t topk,
                                  const char *&extra_infos, void *&iter_ctx,
                                  bool is_last_search, void *allocator)
 {
+#ifdef OB_BUILD_CUVS
+  if (gpu_) {
+    iter_ctx = nullptr;
+    return gpu_->query(query, topk, dist, ids, result_size, parameters, bitmap, reverse_filter,
+                       need_extra_info, extra_infos,
+                       allocator ? static_cast<vsag::Allocator *>(allocator) : allocator_);
+  }
+#endif
+
   int ret = OB_SUCCESS;
   std::function<bool(int64_t)> filter = [bitmap, reverse_filter](int64_t id) -> bool {
     if (!reverse_filter) {
@@ -1247,10 +1117,6 @@ int build_index(VectorIndexPtr &index_handler, float *vector_list,
       dataset->ExtraInfos(extra_infos);
     }
     if (OB_FAIL(hnsw->build_index(dataset))) {
-    } else if (ob_cuvs_marked(index_handler)) {
-      ob_cuvs_register(index_handler, vector_list, ids, dim, size);
-      LOG_INFO("[OBVSAG][cuVS] built GPU CAGRA index alongside VSAG",
-               KP(index_handler), K(dim), K(size));
     }
   }
   return ret;
@@ -1293,10 +1159,7 @@ int add_index(VectorIndexPtr &index_handler, float *vector,
 {
   int ret = OB_SUCCESS;
   ob_vsag_trace("add_dense", (const void*)index_handler, (long)(dim), (long)(size));
-  if (ob_cuvs_marked(index_handler) && index_handler != nullptr &&
-      strcmp(static_cast<HnswIndexHandler *>(index_handler)->get_metric(), "l2") == 0) {
-    ob_cuvs_add(index_handler, vector, ids, dim, size);
-  }
+
   if (index_handler == nullptr || vector == nullptr || ids == nullptr) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[OBVSAG] null pointer addr", KP(index_handler), KP(vector), KP(ids));
@@ -1452,14 +1315,6 @@ int knn_search(VectorIndexPtr &index_handler, float *query_vector,
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[OBVSAG] null pointer addr", KP(index_handler), KP(query_vector));
   } else {
-    if (ob_cuvs_marked(index_handler)) {
-      HnswIndexHandler *cuvs_hnsw = static_cast<HnswIndexHandler *>(index_handler);
-      if (strcmp(cuvs_hnsw->get_metric(), "l2") == 0 &&
-          ob_cuvs_try_search(index_handler, cuvs_hnsw->get_allocator(),
-                             query_vector, dim, topk, dist, ids, result_size, invalid, reverse_filter)) {
-        return OB_SUCCESS;
-      }
-    }
     FilterInterface *bitmap = static_cast<FilterInterface *>(invalid);
     HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
     const IndexType index_type = static_cast<IndexType>(hnsw->get_index_type());
@@ -1501,14 +1356,6 @@ int knn_search(VectorIndexPtr &index_handler, float *query_vector,
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[OBVSAG] null pointer addr", K(index_handler), K(query_vector));
   } else {
-    if (ob_cuvs_marked(index_handler)) {
-      HnswIndexHandler *cuvs_hnsw = static_cast<HnswIndexHandler *>(index_handler);
-      if (strcmp(cuvs_hnsw->get_metric(), "l2") == 0 &&
-          ob_cuvs_try_search(index_handler, cuvs_hnsw->get_allocator(),
-                             query_vector, dim, topk, dist, ids, result_size, invalid, reverse_filter)) {
-        return OB_SUCCESS;
-      }
-    }
     FilterInterface *bitmap = static_cast<FilterInterface *>(invalid);
     HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
     const IndexType index_type = static_cast<IndexType>(hnsw->get_index_type());
@@ -1581,6 +1428,9 @@ int fserialize(VectorIndexPtr &index_handler, std::ostream &out_stream)
     LOG_WARN("[OBVSAG] null pointer addr", K(index_handler));
   } else {
     HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
+#ifdef OB_BUILD_CUVS
+    if (hnsw->gpu()) return hnsw->gpu()->serialize(out_stream);
+#endif
     tl::expected<void, Error> bs = hnsw->get_index()->Serialize(out_stream);
     if (bs.has_value()) {
       LOG_INFO("[OBVSAG] serialize index success");
@@ -1602,6 +1452,9 @@ int fdeserialize(VectorIndexPtr &index_handler,
     LOG_WARN("[OBVSAG] null pointer addr", K(index_handler));
   } else {
     HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
+#ifdef OB_BUILD_CUVS
+    if (hnsw->gpu()) return hnsw->gpu()->deserialize(in_stream);
+#endif
     std::shared_ptr<vsag::Index> hnsw_index;
     bool use_static = hnsw->get_use_static();
     const char *metric = hnsw->get_metric();
@@ -1670,7 +1523,6 @@ int delete_index(VectorIndexPtr &index_handler)
       KP((void *)static_cast<HnswIndexHandler *>(index_handler)->get_index().get()),
       K(static_cast<HnswIndexHandler *>(index_handler)->get_index().use_count()), K(lbt()));
   if (index_handler != nullptr) {
-    ob_cuvs_erase(index_handler);
     delete static_cast<HnswIndexHandler *>(index_handler);
     index_handler = nullptr;
   }
@@ -1733,46 +1585,6 @@ int cuvs_cagra_knn(const float *base, long n, long dim,
   return ::seekdb_cuvs_cagra_knn(base, n, dim, query, nq, topk, out_ids);
 }
 
-// [hipVS/cuVS BATCH operator] Feed nq probe vectors (row-major, dim from the
-// registered index) to ONE GPU call over an add_index-buffered index. Caller
-// allocates out_ids[nq*topk] (original vids) and out_dist[nq*topk]. Returns the
-// number of queries served (nq) or 0 to fall back to CPU. This is the seam a
-// batched vector operator (similarity JOIN / bulk ANN) would call to exploit the
-// ~50-260x GPU batch speedup over per-probe knn_search (single-query gets no win).
-long cuvs_knn_search_batch(void *key, const float *queries, long nq, long topk,
-                           int64_t *out_ids, float *out_dist)
-{
-  if (key == nullptr || queries == nullptr || out_ids == nullptr ||
-      out_dist == nullptr || nq <= 0 || topk <= 0) { return 0; }
-  std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
-  auto it = g_ob_cuvs_reg.find(key);
-  if (it == g_ob_cuvs_reg.end()) { return 0; }
-  ObCuvsEntry *ent = it->second;
-  const size_t n = ent->buf_ids_.size();
-  const bool need_build =
-      (n >= OB_CUVS_MIN_PTS && (ent->bridge_ == nullptr || n >= ent->built_n_ * 2));
-  std::vector<unsigned> off(static_cast<size_t>(nq) * topk);
-  std::vector<float> dst(static_cast<size_t>(nq) * topk);
-  ObCuvsBatchJob job{ent, queries, nq, topk, n, need_build,
-                     off.data(), dst.data(), 0, false};
-  pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
-  if (pthread_create(&tid, &attr, ob_cuvs_batch_job, &job) == 0) { pthread_join(tid, nullptr); }
-  pthread_attr_destroy(&attr);
-  if (job.built_) { ob_vsag_trace("cuvs_batch_build", key, static_cast<long>(ent->dim_), static_cast<long>(n)); }
-  if (job.served_ != nq) { return 0; }
-  for (long q = 0; q < nq; ++q) {
-    for (long i = 0; i < topk; ++i) {
-      const size_t p = static_cast<size_t>(q) * topk + i;
-      const unsigned o = off[p];
-      out_ids[p] = (o < ent->ids_.size()) ? ent->ids_[o] : -1;
-      out_dist[p] = dst[p];
-    }
-  }
-  ob_vsag_trace("cuvs_batch", key, nq, topk);
-  return nq;
-}
-
 // [hipVS/cuVS] One-shot RAW batch ANN for dbms_vector.batch_knn: build CAGRA over
 // base (n x dim, row-major f32), batch-search nq queries in ONE GPU call, free.
 // out_ids/out_dist are caller-allocated [nq*topk]; out_ids get cuVS ROW OFFSETS
@@ -1793,23 +1605,10 @@ long cuvs_batch_knn(const float *base, long n, long dim,
   return job.served_;
 }
 
-// [hipVS/cuVS] Per-index opt-in hooks called by the plugin for lib=cuvs indexes.
-void mark_cuvs_index(void *key) {
-#ifdef OB_BUILD_CUVS
-  if (key == nullptr) { return; }
-  std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
-  g_ob_cuvs_marked.insert(key);
-#else
-  (void)key;
-#endif
-}
-void unmark_cuvs_index(void *key) {
-#ifdef OB_BUILD_CUVS
-  std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
-  g_ob_cuvs_marked.erase(key);
-#else
-  (void)key;
-#endif
+int enable_hipvs_hnsw(VectorIndexPtr handle)
+{
+  if (!handle) return OB_INVALID_ARGUMENT;
+  return static_cast<HnswIndexHandler *>(handle)->enable_hipvs();
 }
 
 } // namespace obvsag

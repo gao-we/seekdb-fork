@@ -578,6 +578,11 @@ int ObVectorIndexUtil::parser_params_from_string(
       }
       param.dim_ = 0; // TODO@xiajin: fill dim
     }
+    if (OB_SUCC(ret) && param.lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS
+        && param.type_ != ObVectorIndexAlgorithmType::VIAT_HNSW) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("hipVS build requires FP32 HNSW", K(ret), K(param.type_));
+    }
     if (OB_SUCC(ret)
         && param.lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS
         && param.dist_algorithm_ != ObVectorIndexDistAlgorithm::VIDA_L2) {

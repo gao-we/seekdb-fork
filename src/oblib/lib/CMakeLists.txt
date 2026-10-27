@@ -92,6 +92,11 @@ else()
     # enable: -DOB_BUILD_CUVS=ON -DCUVS_BRIDGE_LIB=/path/to/libseekdb_cuvs_bridge.so
     if (OB_BUILD_CUVS AND EXISTS "${CUVS_BRIDGE_LIB}")
       target_link_libraries(oblib_lib PUBLIC ${CUVS_BRIDGE_LIB})
+      # VSAG's modified hnswlib has the same C++ symbol names as hipVS's
+      # upstream hnswlib, but a different ABI. Do not interpose its static
+      # archive symbols into the dynamically loaded hipVS implementation.
+      target_link_options(oblib_lib INTERFACE
+        "LINKER:--exclude-libs,libvsag_static.a")
     endif()
   elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
     target_link_libraries(oblib_lib PUBLIC

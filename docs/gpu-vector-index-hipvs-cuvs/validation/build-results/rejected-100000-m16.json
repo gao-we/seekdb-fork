@@ -1,0 +1,69 @@
+{
+  "config": {
+    "port": 2882,
+    "n": 100000,
+    "dim": 128,
+    "nq": 100,
+    "k": 10,
+    "seed": 20261027,
+    "m": 16,
+    "ef_construction": 200,
+    "ef_search": 1000,
+    "rounds": 3,
+    "recall_floor": 0.95,
+    "target_speedup": null,
+    "output": "/root/amd-hnsw/results-100000-complete",
+    "backend": "both",
+    "gpu_log": "/root/amd-hnsw/candidate/log/seekdb.log"
+  },
+  "data_sha256": "f31313e093086bd4f3fda834216e6170651629cb77080ae64f2125327259ad5e",
+  "preparation_seconds": 6.047934183850884,
+  "runs": [
+    {
+      "round": 1,
+      "backend": "vsag",
+      "table": "t_vsag_0",
+      "import_seconds": 1.9006577599793673,
+      "ddl_seconds": 38.86728188022971,
+      "snapshot_processed_rows": 100000,
+      "end_to_end_build_seconds": 38.93258457444608,
+      "recall_at_k": 0.954,
+      "quality_pass": true,
+      "self_query_count": null,
+      "self_query_hits": null,
+      "ddl": "create vector index idx on t_vsag_0(v) with (distance=l2,type=hnsw,lib=vsag,m=16,ef_construction=200,ef_search=1000)"
+    },
+    {
+      "round": 1,
+      "backend": "cuvs",
+      "table": "t_cuvs_0",
+      "import_seconds": 1.7980153746902943,
+      "ddl_seconds": 2.7485509272664785,
+      "snapshot_processed_rows": 100000,
+      "end_to_end_build_seconds": 2.9101405516266823,
+      "recall_at_k": 0.953,
+      "quality_pass": true,
+      "self_query_count": null,
+      "self_query_hits": null,
+      "ddl": "create vector index idx on t_cuvs_0(v) with (distance=l2,type=hnsw,lib=cuvs,m=16,ef_construction=200,ef_search=1000)"
+    },
+    {
+      "round": 2,
+      "backend": "cuvs",
+      "table": "t_cuvs_1",
+      "import_seconds": 1.7827325910329819,
+      "ddl_seconds": 2.722517689689994,
+      "snapshot_processed_rows": 100000,
+      "end_to_end_build_seconds": 2.8816137816756964,
+      "recall_at_k": 0.947,
+      "quality_pass": false,
+      "self_query_count": null,
+      "self_query_hits": null,
+      "ddl": "create vector index idx on t_cuvs_1(v) with (distance=l2,type=hnsw,lib=cuvs,m=16,ef_construction=200,ef_search=1000)"
+    }
+  ],
+  "official_acceptance": "UNDETERMINED: official evaluation configuration not supplied",
+  "seekdb_version": "5.7.25-OceanBase seekdb-v1.4.0.0",
+  "effective_session_ef_search": 1000,
+  "database": "hipvs_build_1793071429621773729"
+}

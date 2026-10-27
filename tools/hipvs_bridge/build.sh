@@ -19,6 +19,12 @@ OUTPUT=${1:-$SCRIPT_DIR/libseekdb_cuvs_bridge.so}
 }
 
 mkdir -p "$(dirname "$OUTPUT")"
+BUILD_TMP=$(mktemp -d)
+trap 'rm -rf "$BUILD_TMP"' EXIT
+
+"$HIPCC" -c -fPIC -O2 -D__HIP_PLATFORM_AMD__ \
+  -I"$HIPVS_ROOT/include" -I"$ROCM_ROOT/include" \
+  "$SCRIPT_DIR/seekdb_cuvs_bridge.c" -o "$BUILD_TMP/cagra.o"
 
 "$HIPCC" \
   -shared \
@@ -27,7 +33,9 @@ mkdir -p "$(dirname "$OUTPUT")"
   -D__HIP_PLATFORM_AMD__ \
   -I"$HIPVS_ROOT/include" \
   -I"$ROCM_ROOT/include" \
-  "$SCRIPT_DIR/seekdb_cuvs_bridge.c" \
+  "$BUILD_TMP/cagra.o" \
+  "$SCRIPT_DIR/seekdb_hipvs_hnsw.cpp" \
+  -std=c++17 -fvisibility=hidden -fvisibility-inlines-hidden \
   -L"$HIPVS_ROOT/lib" \
   -Wl,-soname,libseekdb_cuvs_bridge.so \
   -Wl,-rpath,"$HIPVS_ROOT/lib:$ROCM_ROOT/lib" \

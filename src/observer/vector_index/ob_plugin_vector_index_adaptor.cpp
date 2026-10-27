@@ -786,6 +786,12 @@ int ObPluginVectorIndexAdaptor::fill_vector_index_info(ObVectorIndexInfo &info)
   return ret;
 }
 
+static int enable_hipvs_build_if_needed(ObVectorIndexParam *param, void *handle)
+{
+  return param->lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS
+      ? oceanbase::common::obvsag::enable_hipvs_hnsw(handle) : OB_SUCCESS;
+}
+
 int ObPluginVectorIndexAdaptor::init_mem_data(ObVectorIndexRecordType type, ObVectorIndexAlgorithmType enforce_type)
 {
   INIT_SUCC(ret);
@@ -831,6 +837,7 @@ int ObPluginVectorIndexAdaptor::init_mem_data(ObVectorIndexRecordType type, ObVe
                                                       param->bq_use_fht_))) {
         }
       }
+      if (OB_SUCC(ret)) ret = enable_hipvs_build_if_needed(param, incr_data_->index_);
       if (OB_FAIL(ret)) {
       } else if (OB_ISNULL(incr_data_->bitmap_ = static_cast<ObVectorIndexRoaringBitMap *>
                   (get_allocator()->alloc(sizeof(ObVectorIndexRoaringBitMap))))) {
@@ -923,6 +930,7 @@ int ObPluginVectorIndexAdaptor::init_mem_data(ObVectorIndexRecordType type, ObVe
         }
       }
 
+      if (OB_SUCC(ret)) ret = enable_hipvs_build_if_needed(param, snap_data_->index_);
       if (OB_SUCC(ret)) {
         snap_data_->set_inited();
         LOG_INFO("create snap data success.", K(ret), KP(snap_data_->index_), K(lbt())); // remove later
@@ -980,6 +988,7 @@ int ObPluginVectorIndexAdaptor::init_snap_data_without_lock(ObVectorIndexAlgorit
       }
     }
 
+    if (OB_SUCC(ret)) ret = enable_hipvs_build_if_needed(param, snap_data_->index_);
     if (OB_SUCC(ret)) {
       snap_data_->set_inited();
       LOG_INFO("create snap data success.", K(ret), KP(snap_data_->index_));
@@ -1425,20 +1434,6 @@ int ObPluginVectorIndexAdaptor::init_sparse_vector_type()
   return ret;
 }
 
-// [hipVS/cuVS] Mark a just-populated index handle for the GPU path when the
-// vector index was declared WITH (lib=cuvs) on a dense L2 HNSW index. Idempotent.
-static inline void ob_mark_cuvs_if_needed(void *algo_data, void *handle)
-{
-  ObVectorIndexParam *param = static_cast<ObVectorIndexParam *>(algo_data);
-  if (handle != nullptr && param != nullptr
-      && param->lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS
-      && param->dist_algorithm_ == ObVectorIndexDistAlgorithm::VIDA_L2
-      && (param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW
-          || param->type_ == ObVectorIndexAlgorithmType::VIAT_HGRAPH)) {
-    oceanbase::common::obvsag::mark_cuvs_index(handle);
-  }
-}
-
 int ObPluginVectorIndexAdaptor::insert_rows(blocksstable::ObDatumRow *rows,
                                             const int64_t vid_idx,
                                             const int64_t type_idx,
@@ -1616,7 +1611,6 @@ int ObPluginVectorIndexAdaptor::insert_rows(blocksstable::ObDatumRow *rows,
                                               ))) {
         }
       } else {
-        ob_mark_cuvs_if_needed(algo_data_, incr_data_->index_);
         if (OB_FAIL(obvectorutil::add_index(incr_data_->index_,
                                               vectors,
                                               incr_vids,
@@ -1821,7 +1815,6 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
           lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr("VIndexVsagADP"));
           lib::ObLightBacktraceGuard light_backtrace_guard(false);
           if (!is_sparse_vector_index_type()) {
-            ob_mark_cuvs_if_needed(algo_data_, snap_data_->index_);
             if (OB_FAIL(obvectorutil::add_index(snap_data_->index_, vectors, vids, dim, extra_info_buf, num))) {
             }
           } else {

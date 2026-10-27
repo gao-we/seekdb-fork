@@ -1,137 +1,114 @@
-# hipVS/cuVS GPU vector backend
+# hipVS HNSW construction on AMD GPUs
 
-Status: **Phase 1 implemented and review-gated** on AMD `gfx1100` with ROCm
-7.2.4. This directory documents the current integration and its reproducible
-validation assets. Historical feasibility experiments remain available in Git
-history rather than in the product-facing tree.
+`WITH (distance=l2,type=hnsw,lib=cuvs)` selects an optional FP32 build backend.
+`lib=vsag` retains the original CPU implementation. Enable the backend with
+`OB_BUILD_CUVS=ON` (default OFF).
 
-## Scope
+The bulk construction path buffers the vectors scanned by seekdb, builds the
+base graph with hipVS CAGRA/NN-Descent on the AMD GPU, then uses
+`cuvsHnswFromCagra` with a full CPU hierarchy. It converts the result into a
+CPU-searchable hnswlib HNSW. The GPU path does **not** also call VSAG Add/Build.
+The CPU upper hierarchy, all copies, synchronization, temporary-file conversion,
+and persistence are real build work and must be included in measurements.
 
-The backend adds optional hipVS/cuVS acceleration behind seekdb's existing
-vector adaptor. It does not replace VSAG globally.
+Queries run through seekdb's ordinary SQL vector-index operator. Row offsets are
+mapped to seekdb vector IDs and then to SQL primary keys. The backend supports
+predicate/deletion bitmap filtering and stores extra information with each ID.
+Both the graph and the ID mapping are persisted; loading a persisted index does
+not require constructing a replacement graph or an available GPU.
 
-- GPU support is compiled only with `OB_BUILD_CUVS=ON`; the default is `OFF`.
-- A dense L2 HNSW/HGRAPH index opts in with `WITH (lib=cuvs)`.
-- `lib=vsag` indexes keep their existing CPU behavior.
-- Cosine and inner-product metrics are rejected for `lib=cuvs` at DDL time.
-- Filters, deletes, stale GPU indexes, and unavailable GPUs fall back to VSAG.
-- `dbms_vector.batch_knn` exposes one-call batched GPU ANN for explicit batch
-  workloads.
+## Build
 
-The product integration lives in:
-
-- [`ob_vsag_adaptor.cpp`](../../src/oblib/lib/vector/ob_vsag_adaptor.cpp):
-  per-index marking, buffered vectors, lazy CAGRA build/search, freshness and
-  safety fallback, trace points, and batch entry points.
-- [`ob_plugin_vector_index_adaptor.cpp`](../../src/observer/vector_index/ob_plugin_vector_index_adaptor.cpp):
-  maps declarative `lib=cuvs` indexes to the adaptor handle.
-- [`ob_vector_index_util.cpp`](../../src/observer/vector_index/ob_vector_index_util.cpp):
-  validates the L2-only DDL contract.
-- [`ob_dbms_vector_mysql.cpp`](../../src/pl/sys_package/ob_dbms_vector_mysql.cpp):
-  implements `dbms_vector.batch_knn`.
-
-## Bridge
-
-seekdb links a small C ABI bridge instead of importing hipVS/cuVS C++ types into
-the server. The maintained bridge source and build entry point are under
-[`tools/hipvs_bridge`](../../tools/hipvs_bridge/):
+Install the standard seekdb development dependencies with `./build.sh init`.
+On Ubuntu, `rpm2cpio`, `cpio`, and `m4` are also needed for dependency extraction
+and parser generation. Install the Rust version pinned in
+`rust/rust-toolchain.toml`. Preinstalled hipVS headers/libraries must match ROCm
+and the device architecture (the tested image has gfx1100-only code objects).
 
 ```bash
-tools/hipvs_bridge/build.sh /work/bridge/libseekdb_cuvs_bridge.so
+HIPVS_ROOT=/opt/hipvs ROCM_ROOT=/opt/rocm \
+  tools/hipvs_bridge/build.sh /work/bridge/libseekdb_cuvs_bridge.so
+./build.sh release -DOB_BUILD_CUVS=ON \
+  -DCUVS_BRIDGE_LIB=/work/bridge/libseekdb_cuvs_bridge.so --make -j12
 ```
 
-The bridge exports:
+The bridge C ABI isolates the ROCm compiler from seekdb's compiler.
+The linker hides symbols from `libvsag_static.a` with `--exclude-libs`, and the
+bridge hides its C++ symbols. This prevents VSAG's modified hnswlib from
+interposing into hipVS's differently laid-out hnswlib implementation. The new
+`seekdb_hipvs_hnsw_*` symbols manage GPU construction and the native HNSW graph.
+The inherited `seekdb_cuvs_*` symbols and explicit `dbms_vector.batch_knn`
+operator remain a separate CAGRA query demonstration. Its query timings are
+never construction measurements.
 
-```text
-seekdb_cuvs_build
-seekdb_cuvs_search
-seekdb_cuvs_free
-seekdb_cuvs_cagra_knn
-```
+## Use and timing boundary
 
-Build seekdb with the resulting library:
-
-```bash
-./build.sh release \
-  -DOB_BUILD_CUVS=ON \
-  -DOB_BUILD_CUVS_TRACE=OFF \
-  -DCUVS_BRIDGE_LIB=/work/bridge/libseekdb_cuvs_bridge.so \
-  --make -j64
-```
-
-For a CPU-only build, leave the defaults or pass:
-
-```bash
-./build.sh release \
-  -DOB_BUILD_CUVS=OFF \
-  -DOB_BUILD_CUVS_TRACE=OFF \
-  --make -j64
-```
-
-## SQL usage
-
-Per-index GPU opt-in:
+Import raw data into a table with no vector index, then build:
 
 ```sql
-CREATE TABLE items(
-  id BIGINT PRIMARY KEY,
-  embedding VECTOR(128),
-  VECTOR INDEX idx_embedding(embedding)
-    WITH (distance=l2, type=hnsw, lib=cuvs)
-);
+CREATE VECTOR INDEX idx ON items(embedding)
+WITH (distance=l2,type=hnsw,lib=cuvs,m=16,ef_construction=200,ef_search=512);
+SELECT id FROM items
+ORDER BY l2_distance(embedding, '[...]') APPROXIMATE LIMIT 10;
 ```
 
-Explicit batch ANN writes results to a caller-created output table:
+Snapshot finalization and serialization complete pending GPU construction.
+If a mutable delta has received new vectors, its next query completes the
+pending build before searching. A benchmark must therefore include the first
+forced vector-index query after DDL, even if CREATE INDEX returns earlier.
+The backend serializes operations per index and uses a 32 MiB build worker stack
+because hipVS requires more stack space than seekdb's regular workers provide.
+The initial worker uses 16 host threads for upper-level construction.
+Set the session variable `ob_hnsw_ef_search` explicitly for both backends; its
+default can override the ef_search value written in the index declaration.
 
-```sql
-CALL dbms_vector.batch_knn(
-  "items",
-  "query_vectors",
-  10,
-  "batch_results"
-);
-```
+`HIPVS_HNSW_BUILD ... fallback=0 ready=1` records a completed hipVS build.
+`HIPVS_HNSW_BUILD_FAILED` / `HIPVS_HNSW_ERROR` report failures. Unsupported
+builds and absent GPUs return errors; **there is no CPU build fallback**.
+Filters use the constructed HNSW and do not trigger a second VSAG build.
 
-See [`examples/batch_knn.sql`](examples/batch_knn.sql) for the table contract.
+The initial implementation supports dense FP32 L2 HNSW, `2 <= m <= 64` and
+at least two vectors in a nonempty build. Tiny NN-Descent shapes may be rejected
+by hipVS; rejection propagates instead of silently changing algorithms.
+Quantized HNSW, HGRAPH, other distance types, multi-GPU operation and importing
+old VSAG-formatted `lib=cuvs` snapshots are unsupported. Use a fresh GPU index.
+Normal `lib=vsag` persistence is unchanged.
+After restarting the observer, run `python unittest/hipvs/check_restart.py
+--results /work/results-10000 --port 2881` to compare every saved test query
+with its result before restart.
 
 ## Validation
 
-The self-contained GPU smoke runner generates deterministic vectors and ground
-truth; it does not use private `/work/datasets` or `/work/bench` assets:
-
 ```bash
-LD_LIBRARY_PATH=/work/bridge:/opt/hipvs/lib:/opt/rocm/lib \
-  docs/gpu-vector-index-hipvs-cuvs/validation/run_gpu_smoke.sh \
-    --observer /path/to/trace-build/seekdb \
-    --bridge /work/bridge/libseekdb_cuvs_bridge.so \
-    --base-dir /tmp/seekdb-cuvs-smoke \
-    --port 2981 \
-    --render /dev/dri/renderD135 \
-    --evidence /tmp/seekdb-cuvs-evidence
+python -m pip install numpy pymysql
+python unittest/hipvs/test_bridge.py \
+  --bridge /work/bridge/libseekdb_cuvs_bridge.so
+python unittest/hipvs/benchmark_build.py --port 2881 --n 10000 --dim 128 \
+  --rounds 3 --nq 100 --k 10 --recall-floor .95 \
+  --gpu-log /work/observer/log/seekdb.log --output /work/results-10000
 ```
 
-The runner validates:
+The bridge test repeats construction three times, checks every vector, verifies
+Recall@10 against exact neighbors, filters, save/load equality and explicit
+failure with a hidden GPU. The SQL benchmark uses fresh tables each round,
+imports identical FP32 values before timing, checks the vector execution plan,
+includes first-query readiness, verifies GPU evidence, records all raw timings,
+and uses CPU/GPU medians. It records every document's ANN self-query result in the final round and uses
+independent queries for recall. ANN self-query misses are recorded as search
+quality, rather than treated as proof of missing stored data. Completeness is
+checked separately: snapshot processed count must equal N, and the GPU bridge
+verifies all N graph labels and their bit-exact FP32 vectors against the input
+both after construction and after persistence loading. Set `--target-speedup` only from
+the published evaluation configuration; `.95` is an experimental quality floor,
+not a claim about the competition threshold. Preserve the JSON results and
+query plans. Run profiler tracing separately from timed trials.
 
-- cuVS L2 build/serve and same-process VSAG isolation;
-- non-L2 DDL rejection;
-- filter, delete, and freshness fallback;
-- threshold-triggered CAGRA rebuild;
-- one-call `batch_knn`, row cardinality, and recall;
-- GPU device file descriptors and hidden-GPU fallback;
-- bounded observer cleanup and closed ports.
+Public environment references:
 
-The runner writes a machine-readable `summary.json` into its evidence directory.
-Results for a specific candidate belong in that pull request's description or a
-validation comment rather than in the source tree.
-The no-GPU DDL contract remains covered by
-[`vector_index_cuvs_ddl.test`](../../tools/deploy/mysql_test/test_suite/vector_index/t/vector_index_cuvs_ddl.test).
+- [seekdb GPU integration prerequisite (PR #1314)](https://github.com/oceanbase/seekdb/pull/1314)
+- [AMD hipVS build/install](https://github.com/AMD-Ecosystem/hipVS/blob/release/rocmds-26.03/docs_amd/install/build.rst)
+- [AMD hipVS usage](https://github.com/AMD-Ecosystem/hipVS/blob/release/rocmds-26.03/docs_amd/how-to/using-hipVS.rst)
+- [ROCm installation](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/quick-start.html)
 
-## Current limitations
-
-- Phase 1 supports dense float32 L2 indexes only.
-- GPU indexes are process-local and rebuilt lazily; persistence and cache reuse
-  are follow-up work.
-- The explicit batch API rebuilds its CAGRA index per call.
-- GPU validation is manual because upstream CI has no compatible GPU runner.
-- Multi-GPU, long-duration, and snapshot-reload coverage are out of scope for
-  this phase.
+The private Yuque article requires group authentication. The supplied executed
+Notebook documents batch query acceleration and is not a build-speedup result.
